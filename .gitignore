@@ -6,4 +6,4 @@ dist/
 *.csv
 __pycache__/
 .venv/
-.obsidian/workspace/json
+'FYP Notes'/.obsidian/workspace.json
