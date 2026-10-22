@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SFUgue Testbed</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <!-- Use Mediasoup Client v3 -->
+    <script src="https://cdn.jsdelivr.net/npm/mediasoup-client@3/umd/mediasoup-client.min.js"></script>
+  </head>
+  <body>
+    <h1>SFUgue Local Testbed</h1>
+    <div>
+      <h3>Local Video (Producer)</h3>
+      <video
+        id="localVideo"
+        autoplay
+        muted
+        playsinline
+        style="width: 320px; background: black"
+      ></video>
+    </div>
+    <div>
+      <h3>Remote Video (Consumer)</h3>
+      <video
+        id="remoteVideo"
+        autoplay
+        playsinline
+        style="width: 320px; background: black"
+      ></video>
+    </div>
+    <button id="startBtn">Start Streaming</button>
+
+    <script>
+      const socket = io();
+      let device, producerTransport, consumerTransport, producer, consumer;
+
+      document
+        .getElementById("startBtn")
+        .addEventListener("click", async () => {
+          // 1. Get local webcam video
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+          });
+          document.getElementById("localVideo").srcObject = stream;
+          const track = stream.getVideoTracks()[0];
+
+          // 2. Initialize Mediasoup Device
+          socket.emit(
+            "getRouterRtpCapabilities",
+            async (routerRtpCapabilities) => {
+              device = new window.mediasoupClient.Device();
+              await device.load({ routerRtpCapabilities });
+
+              // 3. Create Producer Transport
+              socket.emit("createProducerTransport", async (params) => {
+                producerTransport = device.createSendTransport(params);
+
+                producerTransport.on(
+                  "connect",
+                  ({ dtlsParameters }, callback, errback) => {
+                    socket.emit(
+                      "connectProducerTransport",
+                      { dtlsParameters },
+                      callback,
+                    );
+                  },
+                );
+
+                producerTransport.on(
+                  "produce",
+                  (parameters, callback, errback) => {
+                    socket.emit(
+                      "produce",
+                      {
+                        kind: parameters.kind,
+                        rtpParameters: parameters.rtpParameters,
+                      },
+                      ({ id }) => {
+                        callback({ id });
+                      },
+                    );
+                  },
+                );
+
+                // 4. Start Producing
+                producer = await producerTransport.produce({ track });
+
+                // 5. Create Consumer Transport
+                socket.emit("createConsumerTransport", async (cParams) => {
+                  consumerTransport = device.createRecvTransport(cParams);
+
+                  consumerTransport.on(
+                    "connect",
+                    ({ dtlsParameters }, callback, errback) => {
+                      socket.emit(
+                        "connectConsumerTransport",
+                        { dtlsParameters },
+                        callback,
+                      );
+                    },
+                  );
+
+                  // 6. Start Consuming
+                  socket.emit(
+                    "consume",
+                    { rtpCapabilities: device.rtpCapabilities },
+                    async ({ id, producerId, kind, rtpParameters }) => {
+                      consumer = await consumerTransport.consume({
+                        id,
+                        producerId,
+                        kind,
+                        rtpParameters,
+                      });
+
+                      const remoteStream = new MediaStream();
+                      remoteStream.addTrack(consumer.track);
+                      document.getElementById("remoteVideo").srcObject =
+                        remoteStream;
+
+                      socket.emit("resume", () => {
+                        console.log("Resumed consumer");
+                      });
+                    },
+                  );
+                });
+              });
+            },
+          );
+        });
+    </script>
+  </body>
+</html>
