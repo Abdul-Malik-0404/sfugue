@@ -1,0 +1,19 @@
+**Kubernetes**, commonly abbreviated as **K8s** (a numeronym representing "K" + 8 letters + "s"), is an **open-source container orchestration platform** originally developed by Google and now maintained by the Cloud Native Computing Foundation (CNCF). It automates the **deployment, scaling, and management** of containerized applications across clusters of servers, handling critical tasks such as load balancing, self-healing, rolling updates, and service discovery.
+
+While tools like **[[Docker]]** package applications into containers, **Kubernetes** acts as the orchestrator that manages these containers at scale, effectively serving as an **operating system for distributed cloud infrastructure**. It allows organizations to run microservices reliably across on-premises, hybrid, or public cloud environments by abstracting the underlying hardware and ensuring applications remain available and performant.
+### 1. What Problems Does Kubernetes Solve?
+If you try to build a distributed system using raw Docker containers across multiple servers, you quickly run into massive headaches:
+- _How do Container A and Container B find each other if their IP addresses change when they restart?_
+- _If a server catches fire or a container crashes at 3:00 AM, who notices and restarts it?_
+- _How do you roll out a software update to 5 nodes simultaneously without dropping user traffic?_
+Kubernetes automates all of this. You write declarative configuration files (YAML manifests) telling Kubernetes: _"I want 2 Mediasoup SFU pods running, 1 Kafka broker, and 1 Prometheus scraper,"_ and Kubernetes continuously works behind the scenes to make sure reality matches your desired state.
+### 2. Core Kubernetes Concepts You'll Use in `sfugue`
+- **Pod:** The smallest deployable unit in Kubernetes. Think of a Pod as a wrapper around a Docker container. In your testbed, your primary Mediasoup worker runs inside `Pod A`, your backup runs inside `Pod B`, and Kafka runs in its own Pod.
+- **Service:** Because Pods get created and destroyed dynamically (meaning their IP addresses change), a Kubernetes **Service** acts as a stable internal load balancer and DNS name so other containers can always find them.
+- **Control Plane:** The "brain" of Kubernetes. It monitors the cluster health, schedules pods onto available compute nodes, and handles automatic restarts if a container crashes.
+- **Custom Resource Definitions (CRDs):** This is Kubernetes' superpower. It lets third-party tools extend Kubernetes. This is how **Chaos Mesh** and **Prometheus** plug right into Kubernetes as native objects.
+### 3. Why Kubernetes is Mandatory for Your FYP (`sfugue`)
+You couldn't easily build or evaluate `sfugue` using simple shell scripts or basic Docker Compose because your evaluation methodology relies entirely on cloud-native primitives:
+1. **Chaos Mesh Integration:** Chaos Mesh is a Kubernetes-native chaos engineering framework. Because your Mediasoup nodes run as Kubernetes Pods, Chaos Mesh can inject precise faults directly into the container network namespace (e.g., _inject 40ms jitter into Pod A_) or kill the pod ungracefully to measure your Time-to-First-Frame (TTFF) recovery latency.
+2. **Prometheus Native Discovery:** Prometheus automatically discovers and scrapes metrics from Kubernetes Pod annotations (`/metrics`), letting you monitor CPU saturation and PLI keyframe request surges across your distributed SFU cluster seamlessly.
+3. **The Control Plane Separation:** Kubernetes allows you to cleanly separate your media plane (Mediasoup pods handling UDP packets) from your control plane (Kafka orchestrating the state handover and Prometheus watching the telemetry death signature).
