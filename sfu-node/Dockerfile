@@ -1,7 +1,8 @@
-FROM node:20-bullseye-slim
+FROM node:22-bookworm-slim
 
-# Install Python & C++ build toolchain for Mediasoup worker compilation
+# Install Python, C++ toolchain, and CA certs for Mediasoup worker prebuild/fallback
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
     python3 \
     python3-pip \
     build-essential \

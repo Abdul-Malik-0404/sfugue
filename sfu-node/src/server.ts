@@ -87,42 +87,75 @@ async function bootstrap(): Promise<void> {
     });
   });
 
-  try {
-    await broker.connect();
-    console.log(
-      `[ControlPlane] Connected ${broker.kind} broker for node=${config.nodeId} (${config.kafkaBrokers.join(",")})`,
-    );
+  let shuttingDown = false;
+  let retryTimer: NodeJS.Timeout | null = null;
+  let stateSubscribed = false;
+  let failoverSubscribed = false;
 
-    if (config.role === "standby") {
-      await broker.subscribe<SessionStateEvent>(
-        config.kafkaTopicSessionState,
-        `${config.kafkaGroupId}-state`,
-        async (event) => {
-          await mediaManager.handleSessionStateSync(event);
-        },
-      );
+  const connectControlPlane = async (attempt = 1): Promise<void> => {
+    const maxAttempts = 24;
+    if (shuttingDown) {
+      return;
     }
 
-    await broker.subscribe<FailoverTriggerEvent>(
-      config.kafkaTopicFailoverTrigger,
-      `${config.kafkaGroupId}-failover`,
-      async (event) => {
-        if (event.eventType !== "PROACTIVE_EVACUATION") {
-          return;
-        }
-        if (config.role === "primary" && event.sourceNodeId === config.nodeId) {
-          signaling.broadcastFailoverDirective(event);
-        } else if (config.role === "standby") {
-          mediaManager.promotePrewarmedSessions(event.correlationId);
-        }
-      },
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(
-      `[ControlPlane] Broker startup skipped (${msg}); SFU continuing in standalone signaling mode`,
-    );
-  }
+    try {
+      await broker.connect();
+
+      if (config.role === "standby" && !stateSubscribed) {
+        await broker.subscribe<SessionStateEvent>(
+          config.kafkaTopicSessionState,
+          `${config.kafkaGroupId}-state`,
+          async (event) => {
+            await mediaManager.handleSessionStateSync(event);
+          },
+        );
+        stateSubscribed = true;
+      }
+
+      if (!failoverSubscribed) {
+        await broker.subscribe<FailoverTriggerEvent>(
+          config.kafkaTopicFailoverTrigger,
+          `${config.kafkaGroupId}-failover`,
+          async (event) => {
+            if (event.eventType !== "PROACTIVE_EVACUATION") {
+              return;
+            }
+            if (config.role === "primary" && event.sourceNodeId === config.nodeId) {
+              signaling.broadcastFailoverDirective(event);
+            } else if (config.role === "standby") {
+              mediaManager.promotePrewarmedSessions(event.correlationId);
+            }
+          },
+        );
+        failoverSubscribed = true;
+      }
+
+      console.log(
+        `[ControlPlane] Connected ${broker.kind} broker for node=${config.nodeId} (${config.kafkaBrokers.join(",")})`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt >= maxAttempts || shuttingDown) {
+        console.warn(
+          `[ControlPlane] Broker connection exhausted after ${attempt} attempts (${msg}); continuing in standalone mode`,
+        );
+        return;
+      }
+
+      console.warn(
+        `[ControlPlane] Broker attempt ${attempt}/${maxAttempts} failed (${msg}); retrying in 5s...`,
+      );
+      await broker.disconnect().catch(() => {});
+      stateSubscribed = false;
+      failoverSubscribed = false;
+
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        void connectControlPlane(attempt + 1);
+      }, 5000);
+      retryTimer.unref();
+    }
+  };
 
   await new Promise<void>((resolve) => {
     server.listen(config.port, () => {
@@ -133,12 +166,19 @@ async function bootstrap(): Promise<void> {
     });
   });
 
-  let shuttingDown = false;
+  // Connect asynchronously after HTTP listener is up so /healthz responds immediately
+  // even while KRaft Kafka finishes booting inside KinD.
+  void connectControlPlane();
+
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) {
       return;
     }
     shuttingDown = true;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
     console.log(`[sfu-node] Received ${signal}, shutting down gracefully...`);
 
     telemetry.stop();

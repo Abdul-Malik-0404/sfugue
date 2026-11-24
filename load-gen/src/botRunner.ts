@@ -124,6 +124,14 @@ async function runSingleBot(
 
   try {
     await page.goto(targetUrl.toString(), { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () =>
+        Boolean(
+          (window as unknown as { __sfugueClientReady?: boolean }).__sfugueClientReady,
+        ),
+      undefined,
+      { timeout: 15_000 },
+    );
     await page.click("#startBtn");
 
     await page.waitForFunction(
