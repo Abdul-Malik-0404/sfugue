@@ -1,9 +1,21 @@
+# Dependencies & build artifacts
 node_modules/
 dist/
+sfu-node/worker/
+
+# Environment variables & secrets
 .env
+.env.*
+!.env.example
+
+# Logs, packet captures & benchmark exports
 *.log
 *.pcap
 *.csv
+
+# Python analysis tooling
 __pycache__/
 .venv/
-.obsidian/workspace.json
+
+# Obsidian local workspace state
+**/.obsidian/workspace.json

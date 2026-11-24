@@ -1,0 +1,74 @@
+# KinD single-node cluster configuration for the sfugue empirical testbed.
+# Hardware constraint (CLAUDE.md): sized to a single control-plane node so
+# total host RAM stays within the 8 GB Arch Linux / 11th Gen Intel i3 budget
+# while leaving headroom for Docker, Playwright Chromium bots, and the OS.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: sfu-testbed
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Mediasoup WebRTC UDP media port window (matching Dockerfile EXPOSE 40000-40010/udp).
+      # Partitioned between sfu-primary (40000-40005) and sfu-standby (40006-40010)
+      # so both pods schedule simultaneously on this single node without hostPort conflict.
+      - containerPort: 40000
+        hostPort: 40000
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40001
+        hostPort: 40001
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40002
+        hostPort: 40002
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40003
+        hostPort: 40003
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40004
+        hostPort: 40004
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40005
+        hostPort: 40005
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40006
+        hostPort: 40006
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40007
+        hostPort: 40007
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40008
+        hostPort: 40008
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40009
+        hostPort: 40009
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      - containerPort: 40010
+        hostPort: 40010
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      # TCP NodePorts for host-side Playwright bots, telemetry-watcher, and Prometheus queries
+      - containerPort: 30000
+        hostPort: 30000
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30001
+        hostPort: 30001
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 30090
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30094
+        hostPort: 30094
+        listenAddress: "127.0.0.1"
+        protocol: TCP

@@ -1,9 +1,13 @@
 {
   "name": "sfu-node",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Mediasoup SFU node with Prometheus death-signature telemetry and Zero-Trust Kafka control-plane handover",
+  "main": "dist/server.js",
   "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

@@ -2,6 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SFUgue Testbed</title>
     <script src="/socket.io/socket.io.js"></script>
     <!-- Use Mediasoup Client v3 -->
@@ -28,104 +29,187 @@
         style="width: 320px; background: black"
       ></video>
     </div>
-    <button id="startBtn">Start Streaming</button>
+    <button id="startBtn" type="button">Start Streaming</button>
+    <pre id="statusLog" aria-live="polite"></pre>
 
     <script>
+      const urlParams = new URLSearchParams(window.location.search);
+      const roomId = urlParams.get("roomId") || "";
+      const peerIdHint = urlParams.get("peerId") || "";
+      const statusEl = document.getElementById("statusLog");
+
+      window.__sfugueMetrics = {
+        roomId: roomId || "default",
+        peerIdHint,
+        startRequestedAtMs: null,
+        firstRemoteFrameAtMs: null,
+        ttffMs: null,
+        consumedKinds: [],
+        failoverEvents: [],
+      };
+
+      function logStatus(message) {
+        console.log("[sfugue-client]", message);
+        if (statusEl) {
+          statusEl.textContent = message;
+        }
+      }
+
+      function emitAsync(socket, eventName, payload) {
+        return new Promise((resolve, reject) => {
+          const handleAck = (response) => {
+            if (response && response.error) {
+              reject(new Error(response.error));
+              return;
+            }
+            resolve(response);
+          };
+
+          if (payload === undefined) {
+            socket.emit(eventName, handleAck);
+          } else {
+            socket.emit(eventName, payload, handleAck);
+          }
+        });
+      }
+
       const socket = io();
-      let device, producerTransport, consumerTransport, producer, consumer;
+      let device;
+      let producerTransport;
+      let consumerTransport;
+      const producers = [];
+      const consumers = [];
+
+      socket.on("proactiveFailover", (directive) => {
+        window.__sfugueMetrics.failoverEvents.push({
+          ...directive,
+          receivedAtMs: performance.now(),
+        });
+        logStatus(
+          `Proactive evacuation directive received -> ${directive.targetSignalingUrl}`,
+        );
+      });
+
+      const remoteVideoEl = document.getElementById("remoteVideo");
+      remoteVideoEl.addEventListener(
+        "playing",
+        () => {
+          if (window.__sfugueMetrics.firstRemoteFrameAtMs === null) {
+            const now = performance.now();
+            window.__sfugueMetrics.firstRemoteFrameAtMs = now;
+            if (window.__sfugueMetrics.startRequestedAtMs !== null) {
+              window.__sfugueMetrics.ttffMs =
+                now - window.__sfugueMetrics.startRequestedAtMs;
+            }
+            logStatus(
+              `Remote playback active (TTFF=${Math.round(window.__sfugueMetrics.ttffMs || 0)}ms)`,
+            );
+          }
+        },
+        { once: true },
+      );
 
       document
         .getElementById("startBtn")
         .addEventListener("click", async () => {
-          // 1. Get local webcam video
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-          });
+          window.__sfugueMetrics.startRequestedAtMs = performance.now();
+          logStatus("Requesting synthetic/local media...");
+
+          // 1. Acquire video + audio (fallback to video-only when mic is unavailable)
+          let stream;
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: true,
+            });
+          } catch {
+            stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          }
+
           document.getElementById("localVideo").srcObject = stream;
-          const track = stream.getVideoTracks()[0];
+          const tracks = stream.getTracks();
+
+          // Optional room join when query params are provided (e.g., load-gen bots)
+          if (roomId) {
+            await emitAsync(socket, "joinRoom", {
+              roomId,
+              peerId: peerIdHint || undefined,
+            });
+          }
 
           // 2. Initialize Mediasoup Device
-          socket.emit(
+          const routerRtpCapabilities = await emitAsync(
+            socket,
             "getRouterRtpCapabilities",
-            async (routerRtpCapabilities) => {
-              device = new window.mediasoupClient.Device();
-              await device.load({ routerRtpCapabilities });
+          );
+          device = new window.mediasoupClient.Device();
+          await device.load({ routerRtpCapabilities });
 
-              // 3. Create Producer Transport
-              socket.emit("createProducerTransport", async (params) => {
-                producerTransport = device.createSendTransport(params);
+          // 3. Create & connect Producer Transport
+          const sendParams = await emitAsync(socket, "createProducerTransport");
+          producerTransport = device.createSendTransport(sendParams);
 
-                producerTransport.on(
-                  "connect",
-                  ({ dtlsParameters }, callback, errback) => {
-                    socket.emit(
-                      "connectProducerTransport",
-                      { dtlsParameters },
-                      callback,
-                    );
-                  },
-                );
-
-                producerTransport.on(
-                  "produce",
-                  (parameters, callback, errback) => {
-                    socket.emit(
-                      "produce",
-                      {
-                        kind: parameters.kind,
-                        rtpParameters: parameters.rtpParameters,
-                      },
-                      ({ id }) => {
-                        callback({ id });
-                      },
-                    );
-                  },
-                );
-
-                // 4. Start Producing
-                producer = await producerTransport.produce({ track });
-
-                // 5. Create Consumer Transport
-                socket.emit("createConsumerTransport", async (cParams) => {
-                  consumerTransport = device.createRecvTransport(cParams);
-
-                  consumerTransport.on(
-                    "connect",
-                    ({ dtlsParameters }, callback, errback) => {
-                      socket.emit(
-                        "connectConsumerTransport",
-                        { dtlsParameters },
-                        callback,
-                      );
-                    },
-                  );
-
-                  // 6. Start Consuming
-                  socket.emit(
-                    "consume",
-                    { rtpCapabilities: device.rtpCapabilities },
-                    async ({ id, producerId, kind, rtpParameters }) => {
-                      consumer = await consumerTransport.consume({
-                        id,
-                        producerId,
-                        kind,
-                        rtpParameters,
-                      });
-
-                      const remoteStream = new MediaStream();
-                      remoteStream.addTrack(consumer.track);
-                      document.getElementById("remoteVideo").srcObject =
-                        remoteStream;
-
-                      socket.emit("resume", () => {
-                        console.log("Resumed consumer");
-                      });
-                    },
-                  );
-                });
-              });
+          producerTransport.on(
+            "connect",
+            ({ dtlsParameters }, callback, errback) => {
+              emitAsync(socket, "connectProducerTransport", { dtlsParameters })
+                .then(() => callback())
+                .catch(errback);
             },
           );
+
+          producerTransport.on("produce", (parameters, callback, errback) => {
+            emitAsync(socket, "produce", {
+              kind: parameters.kind,
+              rtpParameters: parameters.rtpParameters,
+            })
+              .then(({ id }) => callback({ id }))
+              .catch(errback);
+          });
+
+          // 4. Produce every captured track (VP8 video + Opus audio)
+          const producedIds = [];
+          for (const track of tracks) {
+            const producer = await producerTransport.produce({ track });
+            producers.push(producer);
+            producedIds.push(producer.id);
+          }
+
+          // 5. Create & connect Consumer Transport
+          const recvParams = await emitAsync(socket, "createConsumerTransport");
+          consumerTransport = device.createRecvTransport(recvParams);
+
+          consumerTransport.on(
+            "connect",
+            ({ dtlsParameters }, callback, errback) => {
+              emitAsync(socket, "connectConsumerTransport", { dtlsParameters })
+                .then(() => callback())
+                .catch(errback);
+            },
+          );
+
+          // 6. Consume and resume each produced track
+          const remoteStream = new MediaStream();
+          for (const producerId of producedIds) {
+            const cParams = await emitAsync(socket, "consume", {
+              rtpCapabilities: device.rtpCapabilities,
+              producerId,
+            });
+
+            const consumer = await consumerTransport.consume({
+              id: cParams.id,
+              producerId: cParams.producerId,
+              kind: cParams.kind,
+              rtpParameters: cParams.rtpParameters,
+            });
+            consumers.push(consumer);
+            remoteStream.addTrack(consumer.track);
+            window.__sfugueMetrics.consumedKinds.push(consumer.kind);
+          }
+
+          remoteVideoEl.srcObject = remoteStream;
+          await emitAsync(socket, "resume");
+          logStatus(`Streaming active (${window.__sfugueMetrics.consumedKinds.join(", ")})`);
         });
     </script>
   </body>

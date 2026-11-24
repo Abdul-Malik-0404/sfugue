@@ -11,8 +11,10 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-COPY . .
-RUN npx tsc
+COPY tsconfig.json ./
+COPY src/ ./src/
+COPY index.html ./
+RUN npm run build
 
 EXPOSE 3000 40000-40010/udp
 

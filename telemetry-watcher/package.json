@@ -1,0 +1,21 @@
+{
+  "name": "telemetry-watcher",
+  "version": "1.0.0",
+  "description": "Prometheus death-signature detector and UDP-flood ingress discriminator triggering Zero-Trust Kafka failovers",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "kafkajs": "^2.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

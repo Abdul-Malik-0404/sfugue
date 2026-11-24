@@ -1,0 +1,21 @@
+{
+  "name": "load-gen",
+  "version": "1.0.0",
+  "description": "Playwright Chromium headless load generator with W3C Insertable Streams (SFrame AES-GCM) and CPU core pinning",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "run-bot": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

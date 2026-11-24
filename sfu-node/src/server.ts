@@ -1,186 +1,169 @@
-import express from "express";
+/**
+ * Composition root for `sfu-node`.
+ *
+ * Lifecycle guarantees:
+ * 1. Initialize Mediasoup Worker + default Router BEFORE opening HTTP/Socket.IO
+ *    so clients never hit an uninitialized router race on startup.
+ * 2. Expose `/metrics` (Prometheus death-signature telemetry) and `/healthz`.
+ * 3. Connect `IControlPlaneBroker` non-fatally so standalone local media runs
+ *    still work if Kafka is offline, while KinD deployments stream session state
+ *    from `sfu-primary` to `sfu-standby` and react to `PROACTIVE_EVACUATION`.
+ * 4. Cleanly close HTTP, Socket.IO, telemetry timers, broker, and Mediasoup
+ *    worker on `SIGINT`/`SIGTERM`.
+ */
+
 import * as http from "http";
+import * as path from "path";
+import cors from "cors";
+import express from "express";
 import { Server } from "socket.io";
-import * as mediasoup from "mediasoup";
-import { Router } from "mediasoup/node/lib/Router";
-import { Worker } from "mediasoup/node/lib/Worker";
-import { WebRtcTransport } from "mediasoup/node/lib/WebRtcTransport";
+import { createControlPlaneBroker } from "./broker/factory";
+import type { FailoverTriggerEvent, SessionStateEvent } from "./broker/types";
+import { loadConfig } from "./config";
+import { MediaManager } from "./mediasoup/mediaManager";
+import {
+  SignalingHandler,
+  type TypedSocketIoServer,
+} from "./signaling/socketHandler";
+import { SfuTelemetry } from "./telemetry/metrics";
+import type {
+  ClientToServerEvents,
+  ServerToClientEvents,
+} from "./types/signaling";
 
-const app = express();
-app.use(express.static("public"));
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
+async function bootstrap(): Promise<void> {
+  const config = loadConfig();
+  const app = express();
+  app.use(cors({ origin: "*" }));
 
-// Mediasoup state
-let worker: Worker;
-let router: Router;
-let producerTransport: WebRtcTransport | undefined;
-let consumerTransport: WebRtcTransport | undefined;
-let producer: mediasoup.types.Producer | undefined;
-let consumer: mediasoup.types.Consumer | undefined;
+  const indexHtmlPath = path.resolve(__dirname, "..", "index.html");
+  const publicDirPath = path.resolve(__dirname, "..", "public");
 
-// Basic VP8 codec configuration for the router
-const mediaCodecs: mediasoup.types.RtpCodecCapability[] = [
-  {
-    kind: "audio",
-    mimeType: "audio/opus",
-    clockRate: 48000,
-    channels: 2,
-  },
-  {
-    kind: "video",
-    mimeType: "video/VP8",
-    clockRate: 90000,
-    parameters: {
-      "x-google-start-bitrate": 1000,
-    },
-  },
-];
+  app.get(["/", "/index.html"], (_req, res) => {
+    res.sendFile(indexHtmlPath);
+  });
+  app.use(express.static(publicDirPath));
 
-async function startMediasoup() {
-  // 1. Create a Worker (runs as a C++ subprocess)
-  worker = await mediasoup.createWorker({
-    logLevel: "warn",
+  const server = http.createServer(app);
+  const io: TypedSocketIoServer = new Server<
+    ClientToServerEvents,
+    ServerToClientEvents
+  >(server, {
+    cors: { origin: "*" },
   });
 
-  worker.on("died", () => {
-    console.error(
-      "Mediasoup worker died, exiting in 2 seconds... [pid:%d]",
-      worker.pid,
-    );
-    setTimeout(() => process.exit(1), 2000);
-  });
+  const mediaManager = new MediaManager(config);
+  await mediaManager.init();
 
-  // 2. Create a Router (handles media streams between producers and consumers)
-  router = await worker.createRouter({ mediaCodecs });
-  console.log("Mediasoup Router created successfully.");
-}
+  const telemetry = new SfuTelemetry(config, mediaManager);
+  telemetry.start();
 
-async function createWebRtcTransport(): Promise<WebRtcTransport> {
-  const maxIncomingBitrate = 1500000;
-  const initialAvailableOutgoingBitrate = 1000000;
+  const broker = createControlPlaneBroker(config);
+  const signaling = new SignalingHandler(io, config, mediaManager, broker);
+  signaling.attach();
 
-  // 3. Create WebRTC Transport within the router context
-  const transport = await router.createWebRtcTransport({
-    listenIps: [{ ip: "0.0.0.0", announcedIp: "127.0.0.1" }], // Update announcedIp for production
-    enableUdp: true,
-    enableTcp: true,
-    preferUdp: true,
-    initialAvailableOutgoingBitrate,
-  });
-
-  if (maxIncomingBitrate) {
+  app.get("/metrics", async (_req, res) => {
     try {
-      await transport.setMaxIncomingBitrate(maxIncomingBitrate);
-    } catch (error) { }
+      res.set("Content-Type", telemetry.registry.contentType);
+      res.send(await telemetry.renderMetrics());
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).send(msg);
+    }
+  });
+
+  app.get("/healthz", async (_req, res) => {
+    const mediasoupReady = mediaManager.isReady();
+    const brokerHealthy = await broker.healthCheck().catch(() => false);
+    const statusCode = mediasoupReady ? 200 : 503;
+
+    res.status(statusCode).json({
+      status: mediasoupReady ? "ok" : "degraded",
+      nodeId: config.nodeId,
+      role: config.role,
+      mediasoupReady,
+      brokerKind: broker.kind,
+      brokerHealthy,
+    });
+  });
+
+  try {
+    await broker.connect();
+    console.log(
+      `[ControlPlane] Connected ${broker.kind} broker for node=${config.nodeId} (${config.kafkaBrokers.join(",")})`,
+    );
+
+    if (config.role === "standby") {
+      await broker.subscribe<SessionStateEvent>(
+        config.kafkaTopicSessionState,
+        `${config.kafkaGroupId}-state`,
+        async (event) => {
+          await mediaManager.handleSessionStateSync(event);
+        },
+      );
+    }
+
+    await broker.subscribe<FailoverTriggerEvent>(
+      config.kafkaTopicFailoverTrigger,
+      `${config.kafkaGroupId}-failover`,
+      async (event) => {
+        if (event.eventType !== "PROACTIVE_EVACUATION") {
+          return;
+        }
+        if (config.role === "primary" && event.sourceNodeId === config.nodeId) {
+          signaling.broadcastFailoverDirective(event);
+        } else if (config.role === "standby") {
+          mediaManager.promotePrewarmedSessions(event.correlationId);
+        }
+      },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[ControlPlane] Broker startup skipped (${msg}); SFU continuing in standalone signaling mode`,
+    );
   }
 
-  return transport;
+  await new Promise<void>((resolve) => {
+    server.listen(config.port, () => {
+      console.log(
+        `SFU Signaling server (${config.nodeId}, role=${config.role}) listening on port ${config.port}`,
+      );
+      resolve();
+    });
+  });
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.log(`[sfu-node] Received ${signal}, shutting down gracefully...`);
+
+    telemetry.stop();
+    await new Promise<void>((resolve) => {
+      void io.close(() => resolve());
+    });
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+    await broker.disconnect().catch((err: unknown) => {
+      console.warn("[sfu-node] Broker disconnect warning:", err);
+    });
+    await mediaManager.close();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
 }
 
-// Signaling API
-io.on("connection", (socket) => {
-  console.log(`Client connected: ${socket.id}`);
-
-  // Step 1: Client requests RTP capabilities to initialize its device
-  socket.on("getRouterRtpCapabilities", (callback) => {
-    callback(router.rtpCapabilities);
-  });
-
-  // Step 2: Client requests a transport to send media
-  socket.on("createProducerTransport", async (callback) => {
-    try {
-      producerTransport = await createWebRtcTransport();
-      callback({
-        id: producerTransport.id,
-        iceParameters: producerTransport.iceParameters,
-        iceCandidates: producerTransport.iceCandidates,
-        dtlsParameters: producerTransport.dtlsParameters,
-      });
-    } catch (err: any) {
-      callback({ error: err.message });
-    }
-  });
-
-  // Step 3: Client connects the producer transport using DTLS parameters
-  socket.on(
-    "connectProducerTransport",
-    async ({ dtlsParameters }, callback) => {
-      await producerTransport?.connect({ dtlsParameters });
-      callback();
-    },
-  );
-
-  // Step 4: Client starts sending media
-  socket.on("produce", async ({ kind, rtpParameters }, callback) => {
-    producer = await producerTransport?.produce({ kind, rtpParameters });
-    console.log(`Producer created with ID: ${producer?.id}`);
-    callback({ id: producer?.id });
-  });
-
-  // Step 5: Client requests a transport to receive media
-  socket.on("createConsumerTransport", async (callback) => {
-    try {
-      consumerTransport = await createWebRtcTransport();
-      callback({
-        id: consumerTransport.id,
-        iceParameters: consumerTransport.iceParameters,
-        iceCandidates: consumerTransport.iceCandidates,
-        dtlsParameters: consumerTransport.dtlsParameters,
-      });
-    } catch (err: any) {
-      callback({ error: err.message });
-    }
-  });
-
-  // Step 6: Client connects the consumer transport
-  socket.on(
-    "connectConsumerTransport",
-    async ({ dtlsParameters }, callback) => {
-      await consumerTransport?.connect({ dtlsParameters });
-      callback();
-    },
-  );
-
-  // Step 7: Client consumes the media stream
-  socket.on("consume", async ({ rtpCapabilities }, callback) => {
-    try {
-      if (!router.canConsume({ producerId: producer!.id, rtpCapabilities })) {
-        return callback({ error: "Cannot consume" });
-      }
-
-      consumer = await consumerTransport?.consume({
-        producerId: producer!.id,
-        rtpCapabilities,
-        paused: true, // Start paused, let the client resume it
-      });
-
-      callback({
-        id: consumer!.id,
-        producerId: producer!.id,
-        kind: consumer!.kind,
-        rtpParameters: consumer!.rtpParameters,
-      });
-    } catch (err: any) {
-      callback({ error: err.message });
-    }
-  });
-
-  // Step 8: Client resumes the media stream
-  socket.on("resume", async (callback) => {
-    await consumer?.resume();
-    callback();
-  });
-
-  socket.on("disconnect", () => {
-    console.log(`Client disconnected: ${socket.id}`);
-  });
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, async () => {
-  await startMediasoup();
-  console.log(`SFU Signaling server listening on port ${PORT}`);
+bootstrap().catch((err) => {
+  console.error("[sfu-node] Fatal startup error:", err);
+  process.exit(1);
 });
